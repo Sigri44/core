@@ -1091,6 +1091,9 @@
     "addon_start_failed": {
       "message": "Failed to correctly start {addon} app."
     },
+    "bad_base64_string": {
+      "message": "Bad base64 string, cannot decode {b64_string}."
+    },
     "command_template_error": {
       "message": "Parsing template `{command_template}` for entity `{entity_id}` failed with error: {error}."
     },
@@ -1099,6 +1102,12 @@
     },
     "invalid_publish_topic": {
       "message": "Unable to publish: topic template `{topic_template}` produced an invalid topic `{topic}` after rendering ({error})"
+    },
+    "invalid_timings": {
+      "message": "Unable to decode timings from structure {b64_string}."
+    },
+    "modulation_not_supported": {
+      "message": "Only 38k modulation is supported with this configuration, got {modulation}"
     },
     "mqtt_broker_error": {
       "message": "Error talking to MQTT: {error_message}."

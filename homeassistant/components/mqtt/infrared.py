@@ -1,8 +1,10 @@
 """Support for MQTT infrared platform."""
 
+from base64 import b64decode, b64encode
 from collections.abc import Callable
 import logging
-from typing import Any, TypedDict
+from struct import pack, unpack
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import orjson
 import voluptuous as vol
@@ -17,6 +19,7 @@ from homeassistant.components.infrared import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_NAME, CONF_VALUE_TEMPLATE
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.service_info.mqtt import ReceivePayloadType
@@ -28,10 +31,12 @@ from .config import MQTT_BASE_SCHEMA
 from .const import (
     CONF_COMMAND_TEMPLATE,
     CONF_COMMAND_TOPIC,
+    CONF_INFRARED_ENCODING,
     CONF_RETAIN,
     CONF_SCHEMA,
     CONF_STATE_TOPIC,
     DEFAULT_RETAIN,
+    DOMAIN,
     PAYLOAD_NONE,
 )
 from .entity import MqttEntity, async_setup_entity_entry_helper
@@ -101,6 +106,7 @@ EMITTER_SCHEMA = MQTT_BASE_SCHEMA.extend(
         vol.Optional(CONF_COMMAND_TEMPLATE): cv.template,
         vol.Optional(CONF_RETAIN, default=DEFAULT_RETAIN): cv.boolean,
         vol.Optional(CONF_NAME): vol.Any(cv.string, None),
+        vol.Optional(CONF_INFRARED_ENCODING, default="raw"): vol.Any("raw", "tuya_b64"),
     }
 ).extend(MQTT_ENTITY_COMMON_SCHEMA.schema)
 
@@ -110,6 +116,7 @@ RECEIVER_SCHEMA = MQTT_BASE_SCHEMA.extend(
         vol.Required(CONF_STATE_TOPIC): valid_subscribe_topic,
         vol.Optional(CONF_VALUE_TEMPLATE): cv.template,
         vol.Optional(CONF_NAME): vol.Any(cv.string, None),
+        vol.Optional(CONF_INFRARED_ENCODING, default="raw"): vol.Any("raw", "tuya_b64"),
     }
 ).extend(MQTT_ENTITY_COMMON_SCHEMA.schema)
 
@@ -121,6 +128,81 @@ DISCOVERY_SCHEMA = vol.All(
     INFRARED_BASE_SCHEMA,
     validate_mqtt_infrared_discovery,
 )
+
+
+def decode_tuya_timings(b64_string: str) -> list[int]:
+    """Decode the original Tuya Base64 code (including LZ77 compression).
+
+    Returns raw IR timings (microseconds).
+    """
+
+    try:
+        compressed_bytes = b64decode(b64_string)
+    except ValueError as exc:
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="bad_base64_string",
+            translation_placeholders={"b64_string": b64_string},
+        ) from exc
+
+    decompressed = bytearray()
+    pos = 0
+
+    try:
+        while pos < len(compressed_bytes):
+            header = compressed_bytes[pos]
+            pos += 1
+            block_type = header >> 5
+
+            if block_type == 0:
+                # Literal block
+                length = (header & 0x1F) + 1
+                decompressed.extend(compressed_bytes[pos : pos + length])
+                pos += length
+
+            else:
+                # Reference block
+                length = block_type + 2
+                if length == 9:
+                    while compressed_bytes[pos] == 255:
+                        length += 255
+                        pos += 1
+                    length += compressed_bytes[pos]
+                    pos += 1
+
+                distance = ((header & 0x1F) << 8) + compressed_bytes[pos]
+                pos += 1
+                offset = distance + 1
+
+                for _ in range(length):
+                    decompressed.append(decompressed[-offset])
+
+    except IndexError:
+        # Truncated or malformed compressed stream → stop decoding
+        _LOGGER.debug("Partly decoded infrared code, got %s", b64_string)
+
+    num_timings = len(decompressed) // 2
+    timings = unpack(f"<{num_timings}H", decompressed[: num_timings * 2])
+    return [timings[i] * -1 if i % 2 else timings[i] for i in range(len(timings))]
+
+
+def encode_tuya_timings(timings: list[int]) -> str:
+    """Encodes raw timings to Tuya Base64 without LZ77 compression.
+
+    Using 'Level 0' prevents hardware crashes on cheap Tuya IR chips.
+    """
+    raw_bytes = pack(f"<{len(timings)}H", *(abs(t) for t in timings))
+    compressed = bytearray()
+    pos = 0
+
+    while pos < len(raw_bytes):
+        chunk = raw_bytes[pos : pos + 32]
+        # Level 0 block header: 3 MSB = 0, 5 LSB = length - 1
+        compressed.append(len(chunk) - 1)
+        compressed.extend(chunk)
+        pos += 32
+
+    return b64encode(compressed).decode("utf-8")
 
 
 async def async_setup_entry(
@@ -154,6 +236,7 @@ class MqttInfraredEmitterEntity(MqttEntity, InfraredEmitterEntity):
     _command_template: Callable[
         [PublishPayloadType, dict[str, Any]], PublishPayloadType
     ]
+    _ir_encoding: str
 
     @staticmethod
     def config_schema() -> VolSchemaType:
@@ -166,25 +249,41 @@ class MqttInfraredEmitterEntity(MqttEntity, InfraredEmitterEntity):
             config.get(CONF_COMMAND_TEMPLATE),
             entity=self,
         ).async_render
-
-    async def _subscribe_topics(self) -> None:
-        """(Re)Subscribe to topics."""
+        self._ir_encoding = config[CONF_INFRARED_ENCODING]
 
     @callback
     def _prepare_subscribe_topics(self) -> None:
         """(Re)Subscribe to topics."""
 
+    async def _subscribe_topics(self) -> None:
+        """(Re)Subscribe to topics."""
+
     async def async_send_command(self, command: InfraredCommand) -> None:
         """Send an IR command via MQTT."""
-
+        timings = command.get_raw_timings()
         command_vars: dict[str, Any] = {
-            "timings": command.get_raw_timings(),
+            "timings": timings,
             "modulation": command.modulation,
             "repeat_count": command.repeat_count,
         }
-        payload = self._command_template(
-            orjson.dumps(command_vars).decode(), command_vars
-        )
+        if self._ir_encoding == "tuya_b64":
+            if command.repeat_count:
+                _LOGGER.warning(
+                    "Ignoring repeat count for %s when publishing infrared signal, "
+                    "repeat count is not supported with this configuration",
+                    self.entity_id,
+                )
+            if command.modulation != 38000:
+                raise ServiceValidationError(
+                    translation_domain=DOMAIN,
+                    translation_key="modulation_not_supported",
+                    translation_placeholders={"modulation": command.modulation},
+                )
+            payload = self._command_template(encode_tuya_timings(timings), command_vars)
+        else:
+            payload = self._command_template(
+                orjson.dumps(command_vars).decode(), command_vars
+            )
         await self.async_publish_with_config(self._config[CONF_COMMAND_TOPIC], payload)
 
 
@@ -196,6 +295,7 @@ class MqttInfraredReceiverEntity(MqttEntity, InfraredReceiverEntity):
     _entity_id_format = infrared.ENTITY_ID_FORMAT
 
     _value_template: Callable[[ReceivePayloadType], ReceivePayloadType]
+    _ir_encoding: str
 
     @staticmethod
     def config_schema() -> VolSchemaType:
@@ -208,6 +308,7 @@ class MqttInfraredReceiverEntity(MqttEntity, InfraredReceiverEntity):
             config.get(CONF_VALUE_TEMPLATE),
             entity=self,
         ).async_render_with_possible_json_value
+        self._ir_encoding = config[CONF_INFRARED_ENCODING]
 
     @callback
     def _handle_state_message_received(self, msg: ReceiveMessage) -> None:
@@ -220,6 +321,30 @@ class MqttInfraredReceiverEntity(MqttEntity, InfraredReceiverEntity):
                 self._config[CONF_STATE_TOPIC],
                 self._config.get(CONF_VALUE_TEMPLATE),
             )
+            return
+        if self._ir_encoding == "tuya_b64":
+            if TYPE_CHECKING:
+                assert isinstance(payload, str)
+            try:
+                timings = decode_tuya_timings(payload)
+            except HomeAssistantError as exc:
+                _LOGGER.warning(
+                    "Invalid message %s received for %s on topic %s, with template %s. "
+                    "Message is not a valid signal base64 encoded IR message. "
+                    "Error: %s",
+                    msg.payload,
+                    self.entity_id,
+                    self._config[CONF_STATE_TOPIC],
+                    self._config.get(CONF_VALUE_TEMPLATE),
+                    exc,
+                )
+            else:
+                signal_message = SignalMessage(
+                    modulation=38000,
+                    timings=timings,
+                )
+                self._handle_received_signal(InfraredReceivedSignal(**signal_message))
+
             return
         try:
             payload_dict = SIGNAL_SCHEMA(json_loads_object(payload))
